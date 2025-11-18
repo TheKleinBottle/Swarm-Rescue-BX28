@@ -7,11 +7,22 @@ from swarm_rescue.simulation.drone.controller import CommandsDict
 from swarm_rescue.solutions.my_drone_lidar_communication import MyDroneLidarCommunication
 from typing import Optional, Tuple, Dict, Any, List
 
-from numpy import pi
+from numpy import pi, cos, sin
 
 
 class MyDroneEval(MyDroneLidarCommunication):
-    pass
+    def define_message_for_all(self) -> Tuple[Optional[int], Tuple[Any, Any]]:
+        """
+        Define the message, the drone will send to and receive from other surrounding drones.
+
+        Returns:
+            Tuple[Optional[int], Tuple[Any, Any]]: The message data.
+        """
+        msg_data = (self.identifier,
+                    (self.measured_gps_position(), self.measured_compass_angle()))
+        print(self.gps_values())
+        #print(self.lidar_possible_paths())
+        return msg_data 
 
 class MyDroneEval1(MyDroneMotionless):
     """
@@ -28,6 +39,9 @@ class MyDroneEval1(MyDroneMotionless):
         max_ray=0,0
         ray_ini=False
         minimal_distance=285
+        coords=self.gps_values()
+        angle=self.measured_compass_angle()
+        step_forward=50
 
         if not self.lidar_is_disabled():
             lidar_data=self.lidar_values()
@@ -43,7 +57,7 @@ class MyDroneEval1(MyDroneMotionless):
                         max_ray=ray_angles[i-1],i-1
                         if max_ray!=min_ray and min_ray[1]+3<max_ray[1]:
                             #list_test.append((min_ray,max_ray))
-                            list_possible_area.append(((min_ray[0]+max_ray[0])/2,False))
+                            list_possible_area.append(((coords[0]+step_forward*(cos(angle+(min_ray[0]+max_ray[0])/2)),coords[1]+step_forward*(sin(angle+(min_ray[0]+max_ray[0])/2))),False))
                 if i==len(lidar_data)-23 and min_ray[1]>max_ray[1]:
                     if ray_ini:
                         boolean=True
@@ -56,14 +70,13 @@ class MyDroneEval1(MyDroneMotionless):
                         if boolean:
                             del list_possible_area[0]
                             #list_test.append((min_ray,max_ray))
-                            list_possible_area.append(((min_ray[0]+2*pi+max_ray[0])/2%2*pi,False))
+                            list_possible_area.append(((coords[0]+step_forward*(cos(angle+(min_ray[0]+max_ray[0])/2)),coords[1]+step_forward*(sin(angle+(min_ray[0]+max_ray[0])/2))),False))
                             return list_possible_area
 
                     max_ray=ray_angles[i],i
                     #list_test.append((min_ray,max_ray))
-                    list_possible_area.append(((min_ray[0]+max_ray[0])/2,False))
-
-
+                    list_possible_area.append(((coords[0]+step_forward*(cos(angle+(min_ray[0]+max_ray[0])/2)),coords[1]+step_forward*(sin(angle+(min_ray[0]+max_ray[0])/2))),False))
+        
         return list_possible_area
     
 
@@ -77,6 +90,7 @@ class MyDroneEval1(MyDroneMotionless):
         """
         msg_data = (self.identifier,
                     (self.measured_gps_position(), self.measured_compass_angle()))
+        print(self.lidar_possible_paths())
         return msg_data 
     
 
