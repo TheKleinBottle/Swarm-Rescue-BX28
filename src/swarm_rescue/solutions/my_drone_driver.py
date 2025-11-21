@@ -1,5 +1,8 @@
 import math
 from swarm_rescue.simulation.drone.controller import CommandsDict
+from swarm_rescue.simulation.drone.drone_sensors import DroneCompass, DroneGPS, DroneOdometer
+from swarm_rescue.simulation.utils.utils import normalize_angle
+import numpy as np
 
 class MyDroneDriver:
     SAFE_DISTANCE = 20    
@@ -7,11 +10,31 @@ class MyDroneDriver:
     Kp_FORWARD = 0.5       
 
     def __init__(self):
-        self.estimated_pos = [0.0, 0.0]
+        self.gps = DroneGPS(anchor = self)
+        self.compass = DroneCompass(anchor = self)
+        self.odometer = DroneOdometer(anchor = self)
+        self.estimated_pos = np.array([0.0, 0.0])
         self.estimated_angle = 0.0
+        self.normalize_angle = normalize_angle # Assume normalize_angle is passed or defined elsewhere
+
+        # self.estimated_pos = [0.0, 0.0]
+        # self.estimated_angle = 0.0
         self.current_target = [0.0, 0.0]
         self.lidar_values_list = []       
         self.current_grasper_state = 0    
+
+    def navigate(self):
+        gps_pos = self.gps.get_sensor_values()
+
+        if gps_pos is not None:
+            self.estimated_pos = gps_pos
+            self.estimated_angle = self.compass.get_sensor_values()
+        else:
+            dist, alpha, theta = self.odometer.get_sensor_values()
+            old_angle = self.estimated_angle + alpha
+            self.estimated_pos[0] += dist * math.cos(old_angle)
+            self.estimated_pos[1] += dist * math.sin(old_angle)
+            self.estimated_angle = self.normalize_angle(self.estimated_angle + theta)
 
     def normalize_angle(self, angle: float) -> float:
         while angle > math.pi:
@@ -19,6 +42,7 @@ class MyDroneDriver:
         while angle < -math.pi:
             angle += 2 * math.pi
         return angle
+    
     def move_to_target(self) -> CommandsDict:
         """
         Generates movement commands to reach self.current_target from self.estimated_pos.
