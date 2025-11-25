@@ -15,7 +15,7 @@ SAFE_DISTANCE = 40      # Safe distance (pixels) to avoid collisions
 KP_ROTATION = 2.0       # P coefficient for rotation
 KP_FORWARD = 0.5        # P coefficient for forward movement
 MAX_LIDAR_RANGE = 150   # Threshold to consider as "frontier"
-REACH_THRESHOLD = 10.0  # Distance to consider as reached destination
+REACH_THRESHOLD = 20.0  # Distance to consider as reached destination
 
 
 class MyStatefulDrone(DroneAbstract):
@@ -141,44 +141,50 @@ class MyStatefulDrone(DroneAbstract):
 
 
     def move_to_target(self) -> CommandsDict:
-        """Control drone to move to self.current_target."""
+        """Điều khiển drone đi đến self.current_target với cơ chế GIẢM TỐC."""
         print(f'Going to {self.current_target}')
         if self.current_target is None:
             return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0, "grasper": 0}
 
-
-        # Anhad's P-Controller logic (modified)
         delta_x = self.current_target[0] - self.estimated_pos[0]
         delta_y = self.current_target[1] - self.estimated_pos[1]
         dist_to_target = math.hypot(delta_x, delta_y)
 
-
-        # 1. Rotate towards target
+        # 1. Xoay về hướng mục tiêu
         target_angle = math.atan2(delta_y, delta_x)
         angle_error = normalize_angle(target_angle - self.estimated_angle)
         
         rotation_cmd = KP_ROTATION * angle_error
         rotation_cmd = max(-1.0, min(1.0, rotation_cmd))
 
+        # 2. Tiến tới (CÓ GIẢM TỐC)
+        
+        # --- SỬA ĐỔI Ở ĐÂY ---
+        if dist_to_target > 100:
+            # Còn xa: Đi nhanh
+            forward_cmd = 1.0
+        elif dist_to_target > 20:
+            # Đến gần (20-100px): Giảm tốc tuyến tính
+            # Tốc độ sẽ giảm dần từ 1.0 xuống 0.2
+            forward_cmd = dist_to_target / 100.0
+            forward_cmd = max(0.2, forward_cmd) # Không được chậm quá 0.2
+        else:
+            # Rất gần (< 20px): Đi rất chậm để "hạ cánh" chính xác
+            forward_cmd = 0.1
+        # ---------------------
 
-        # 2. Move forward (reduce speed if need to rotate much)
-        forward_cmd = KP_FORWARD * dist_to_target
-        if abs(angle_error) > 0.5: # If angle deviation > 30 degrees
-            forward_cmd = 0.0      # Stop to rotate properly
-        forward_cmd = max(-1.0, min(1.0, forward_cmd))
+        # Nếu góc lệch lớn, dừng lại để xoay cho chuẩn
+        if abs(angle_error) > 0.5: 
+            forward_cmd = 0.0      
 
-
-        # 3. Emergency collision avoidance (Lidar Safety)
+        # 3. Tránh va chạm (Lidar Safety) - Giữ nguyên của bạn
         lidar_vals = self.lidar_values()
         if lidar_vals is not None:
-            # Check front (index 90)
             if lidar_vals[90] < SAFE_DISTANCE:
-                forward_cmd = 0.0 # Emergency stop
-                rotation_cmd = 1.0 # Rotate left to escape
-
+                forward_cmd = 0.0 
+                rotation_cmd = 1.0 
 
         grasper_val = 1 if (self.state == "RESCUING" or self.state == "RETURNING") else 0
-
 
         return {
             "forward": forward_cmd, 
@@ -239,8 +245,8 @@ class MyStatefulDrone(DroneAbstract):
                 print(f'Arrived {self.current_target}')
                 
                 # 2. Update Mapper (To find new paths)
-                self.update_mapper()
                 if self.current_target is None: self.visit(self.estimated_pos)
+                self.update_mapper()
 
 
                 pos_key = tuple(self.estimated_pos)
