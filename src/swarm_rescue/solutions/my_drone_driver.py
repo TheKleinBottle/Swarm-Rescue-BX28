@@ -89,7 +89,7 @@ class MyStatefulDrone(DroneAbstract):
         if coords is None: return [] # Tránh crash nếu mất GPS mà chưa có estimated_pos
 
         angle = self.measured_compass_angle()
-        step_forward = 125
+        step_forward = 128
 
         # Hàm phụ để tính độ lệch góc (dùng để sắp xếp)
         def sort_key_by_angle(item):
@@ -242,7 +242,7 @@ class MyStatefulDrone(DroneAbstract):
 
         # --- LOGIC ĐẶC BIỆT CHO RETURNING (Cõng người) ---
         if self.state == "RETURNING":
-            forward_cmd = 0.5
+            forward_cmd = 0.7
         # else:
         #     print(f'Spec of moving, forward: {forward_cmd}, rotation: {rotation_cmd}')
 
@@ -274,6 +274,7 @@ class MyStatefulDrone(DroneAbstract):
 
 
     def control(self) -> CommandsDict:
+        check_center = False
         
         # 1. Update Navigator (Always run first)
         self.update_navigator()
@@ -294,6 +295,7 @@ class MyStatefulDrone(DroneAbstract):
                 
                 if data.entity_type == DroneSemanticSensor.TypeEntity.RESCUE_CENTER:
                     # Save station position for later use
+                    check_center = True
                     if self.rescue_center_pos is None:
                         angle_global = self.estimated_angle + data.angle
                         rx = self.estimated_pos[0] + data.distance * math.cos(angle_global)
@@ -370,32 +372,38 @@ class MyStatefulDrone(DroneAbstract):
 
         # --- STATE: RETURNING ---
         elif self.state == "RETURNING":
-            print(f'Return, dist: {np.linalg.norm(self.estimated_pos - self.current_target)}')
-            if np.linalg.norm(self.estimated_pos - self.current_target) < REACH_THRESHOLD:
+            if check_center:
+                print(f'See rescue center at {self.rescue_center_pos} with dist {np.linalg.norm(self.estimated_pos - self.rescue_center_pos)}')
+                self.current_target = self.rescue_center_pos
+                if found_rescue_pos and np.linalg.norm(self.estimated_pos - self.current_target) < 20:
+                    print(f'Start dropping person at {self.estimated_pos}')
+                    self.state = "DROPPING"
+            else:
 
-                current_key = tuple(self.current_target) if self.current_target is not None else None
-                print(f'Check key {current_key} and {current_key in self.path_history}')
-                if current_key and current_key in self.path_history: 
-                    print(f'Check parent: {self.path_history[current_key]}')
-                    self.current_target = self.path_history[current_key]
-                    print(f'Going back to parent')
-                else:
-                    # If rescue center found -> go straight to it
-                    if self.rescue_center_pos is not None:
-                        self.current_target = self.rescue_center_pos
-                    
-                    # If reached destination (station)
-                    if found_rescue_pos and np.linalg.norm(self.estimated_pos - self.current_target) < REACH_THRESHOLD:
-                        self.state = "DROPPING"
-            print(f'Going back to {self.current_target}, at {self.estimated_pos}')
+                print(f'Return, dist: {np.linalg.norm(self.estimated_pos - self.current_target)}')
+                if np.linalg.norm(self.estimated_pos - self.current_target) < REACH_THRESHOLD:
+
+                    current_key = tuple(self.current_target) if self.current_target is not None else None
+                    print(f'Check key {current_key} and {current_key in self.path_history}')
+                    if current_key and current_key in self.path_history: 
+                        print(f'Check parent: {self.path_history[current_key]}')
+                        self.current_target = self.path_history[current_key]
+                        print(f'Going back to parent')
+                    else:
+                        # If rescue center found -> go straight to it
+                        if self.rescue_center_pos is not None:
+                            self.current_target = self.rescue_center_pos
+                        
+                        # If reached destination (station)
+                        if found_rescue_pos and np.linalg.norm(self.estimated_pos - self.current_target) < REACH_THRESHOLD:
+                            self.state = "DROPPING"
+                print(f'Going back to {self.current_target}, at {self.estimated_pos}')
 
 
         # --- STATE: DROPPING ---
         elif self.state == "DROPPING":
             # Stop and release
-            if not self.grasped_wounded_persons():
-                self.state = "EXPLORING" # Return to search mode
-                return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0, "grasper": 0}
+            print(f'Finish dropped')
             return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0, "grasper": 0}
 
 
