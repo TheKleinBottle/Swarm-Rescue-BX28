@@ -88,7 +88,7 @@ class MyStatefulDrone(DroneAbstract):
         coords = self.estimated_pos
         if coords is None: return [] # Tránh crash nếu mất GPS mà chưa có estimated_pos
 
-        angle = self.measured_compass_angle()
+        angle = self.estimated_angle
         step_forward = 128
 
         # Hàm phụ để tính độ lệch góc (dùng để sắp xếp)
