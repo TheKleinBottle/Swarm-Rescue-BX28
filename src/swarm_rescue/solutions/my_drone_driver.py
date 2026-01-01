@@ -300,7 +300,7 @@ class MyStatefulDrone(DroneAbstract):
         self.update_navigator()
         # 2. Process Communications (Update knowledge from other drones)
         self.comms_visited()
-        print(self.visited_node)
+        #print(self.visited_node)
         
         # 3. Process Semantic Sensor (Find person / Station)
         semantic_data = self.semantic_values()
