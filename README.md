@@ -290,6 +290,28 @@ You must create a class that inherits from `DroneAbstract`. This class is your d
 
 **Golden Rule:** In your code, use **only** sensor data (e.g., `measured_gps_position()`) and not the true simulation values (e.g., `true_position()`). This is essential to prepare for the actual competition conditions where ground truth is not available.
 
+### Baseline decentralized controller (this repo)
+
+The default solution in `src/swarm_rescue/solutions/my_drone_driver.py` implements a deterministic, decentralized policy shared by all drones. Each drone keeps only local state and communicates opportunistically, with no global coordinator.
+
+**Agent state variables**
+- Local occupancy grid keyed by discrete cells to mark free/occupied space.
+- Visit counters per cell to discourage revisits.
+- Last known positions of teammates received via communication.
+- Victim detections with timestamps and last-seen positions.
+- Rescue center position when observed.
+
+**Decision logic**
+- **Perception update:** fuse GPS/odometer for position, project lidar rays into the grid, mark visited cells, and log semantic detections (victims/rescue center).
+- **Frontier exploration:** define frontier cells as unknown cells adjacent to known free cells and choose the closest frontier with penalties for teammate proximity and repeated visits.
+- **Coordination:** drones broadcast their position and detected victims; each drone commits to a victim only if it is the closest known agent, otherwise it continues exploring.
+- **Rescue flow:** on victim commitment, approach and grasp the victim, then return to the rescue center and release before resuming exploration.
+
+**Known limitations**
+- Grid resolution is coarse and does not model dynamic obstacles.
+- Frontier selection is greedy and may miss globally optimal coverage.
+- Victim assignment relies on possibly stale teammate positions.
+
 ## Useful Directories
 
 - `src/swarm_rescue/solutions`: **Your code.** Examples are provided here.
