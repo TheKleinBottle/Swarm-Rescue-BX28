@@ -1,451 +1,354 @@
 import math
+from collections import defaultdict
+from typing import Dict, Optional, Tuple
+
 import numpy as np
-from typing import Optional, List, Tuple, Dict, Any
 
-
-# Import necessary modules from framework
 from swarm_rescue.simulation.drone.controller import CommandsDict
 from swarm_rescue.simulation.drone.drone_abstract import DroneAbstract
-from swarm_rescue.simulation.utils.utils import normalize_angle
 from swarm_rescue.simulation.ray_sensors.drone_semantic_sensor import DroneSemanticSensor
+from swarm_rescue.simulation.utils.utils import normalize_angle
 
-
-# --- CONFIGURATION ---
-SAFE_DISTANCE = 40      # Safe distance (pixels) to avoid collisions
-KP_ROTATION = 2.0       # P coefficient for rotation
-KP_FORWARD = 0.5        # P coefficient for forward movement
-MAX_LIDAR_RANGE = 150   # Threshold to consider as "frontier"
-REACH_THRESHOLD = 25.0  # Distance to consider as reached destination
+GRID_RESOLUTION = 20.0
+FRONTIER_SEARCH_RADIUS = 35
+FRONTIER_DISTANCE_WEIGHT = 1.0
+FRONTIER_REPULSION_WEIGHT = 60.0
+FRONTIER_VISIT_WEIGHT = 4.0
+AGENT_REPULSION_RADIUS = 140.0
+VICTIM_ASSIGNMENT_MARGIN = 20.0
+VICTIM_GRAB_DISTANCE = 22.0
+RESCUE_DROP_DISTANCE = 25.0
+STALE_MESSAGE_TICKS = 150
 
 
 class MyStatefulDrone(DroneAbstract):
-    
     def __init__(self, identifier: Optional[int] = None, **kwargs):
         super().__init__(identifier=identifier, **kwargs)
-        
-        # --- 1. NAVIGATOR VARIABLES (Quoc Viet & Anhad) ---
-        # Estimated position and angle (More reliable than raw GPS)
-        self.estimated_pos = np.array([0.0, 0.0]) 
+        self.estimated_pos = np.array([0.0, 0.0])
         self.estimated_angle = 0.0
-        self.gps_last_known = None # To check when GPS is lost/recovered
+        self.last_gps = None
 
+        self.occupancy: Dict[Tuple[int, int], int] = {}
+        self.visit_counts: Dict[Tuple[int, int], int] = defaultdict(int)
+        self.known_agents: Dict[int, Tuple[np.ndarray, int]] = {}
+        self.known_victims: Dict[Tuple[int, int], Tuple[np.ndarray, int]] = {}
 
-        # --- 2. MAPPER VARIABLES (Marc) ---
-        self.edge = {}
-        self.visited_node = []
-        
-        # --- 3. COMMANDER VARIABLES (Van Khue) ---
-        self.state = "EXPLORING" # EXPLORING, RESCUING, RETURNING, DROPPING
-        self.path_history = {}
-        self.current_target = None # Current target point (np.array)
-        self.rescue_center_pos = None # Rescue center position (save when found)
-
-        self.position_before_rescue = None
-        self.initial_position = None
-        self.cnt_timestep = 0
+        self.state = "EXPLORE"
+        self.current_target: Optional[np.ndarray] = None
+        self.rescue_center_pos: Optional[np.ndarray] = None
+        self.target_victim_key: Optional[Tuple[int, int]] = None
 
     def reset(self):
-        # --- 1. NAVIGATOR VARIABLES (Quoc Viet & Anhad) ---
-        # Estimated position and angle (More reliable than raw GPS)
-        self.estimated_pos = np.array([0.0, 0.0]) 
+        self.estimated_pos = np.array([0.0, 0.0])
         self.estimated_angle = 0.0
-        self.gps_last_known = None # To check when GPS is lost/recovered
+        self.last_gps = None
 
+        self.occupancy.clear()
+        self.visit_counts.clear()
+        self.known_agents.clear()
+        self.known_victims.clear()
 
-        # --- 2. MAPPER VARIABLES (Marc) ---
-        self.edge = {}
-        self.visited_node = []
-        
-        # --- 3. COMMANDER VARIABLES (Van Khue) ---
-        self.state = "EXPLORING" # EXPLORING, RESCUING, RETURNING, DROPPING
-        self.path_history = {}
-        self.current_target = None # Current target point (np.array)
-        self.rescue_center_pos = None # Rescue center position (save when found)
+        self.state = "EXPLORE"
+        self.current_target = None
+        self.rescue_center_pos = None
+        self.target_victim_key = None
 
-        self.position_before_rescue = None
+    def world_to_cell(self, pos: np.ndarray) -> Tuple[int, int]:
+        return (int(math.floor(pos[0] / GRID_RESOLUTION)),
+                int(math.floor(pos[1] / GRID_RESOLUTION)))
 
-    def update_navigator(self):
-        """Update estimated position based on GPS (if available) or Odometer."""
+    def cell_to_world(self, cell: Tuple[int, int]) -> np.ndarray:
+        return np.array([
+            (cell[0] + 0.5) * GRID_RESOLUTION,
+            (cell[1] + 0.5) * GRID_RESOLUTION,
+        ])
+
+    def update_estimate(self) -> None:
         gps_pos = self.measured_gps_position()
         compass_angle = self.measured_compass_angle()
-        
         if gps_pos is not None and compass_angle is not None:
-            # GOOD GPS: Trust GPS
             self.estimated_pos = gps_pos
             self.estimated_angle = compass_angle
-            self.gps_last_known = gps_pos
-        
-        else:
-            # GPS LOST: Use Odometer for accumulation (Dead Reckoning)
-            odom = self.odometer_values() # [dist, alpha, theta]
-            if odom is not None:
-                dist, alpha, theta = odom[0], odom[1], odom[2]
-                
-                # Quoc Viet's logic:
-                # Alpha is the movement direction relative to OLD orientation
-                move_angle = self.estimated_angle + alpha
-                
-                self.estimated_pos[0] += dist * math.cos(move_angle)
-                self.estimated_pos[1] += dist * math.sin(move_angle)
-                
-                # Update new angle
-                self.estimated_angle = normalize_angle(self.estimated_angle + theta)
-        if self.initial_position is None: self.initial_position = self.estimated_pos
+            self.last_gps = gps_pos
+            return
 
+        odom = self.odometer_values()
+        if odom is not None:
+            dist, alpha, theta = odom[0], odom[1], odom[2]
+            move_angle = self.estimated_angle + alpha
+            self.estimated_pos[0] += dist * math.cos(move_angle)
+            self.estimated_pos[1] += dist * math.sin(move_angle)
+            self.estimated_angle = normalize_angle(self.estimated_angle + theta)
 
-    def lidar_possible_paths(self) -> List:
-        '''
-        Collect Lidar data, analyze and return a list of potential areas (Frontiers).
-        Modified: Sort the list to prioritize points directly IN FRONT of the drone.
-        Returns an empty list if GPS is not working and there is no self.estimated_pos
-        '''
-        list_possible_area = []
-        min_ray = -3/4 * math.pi, 0
-        max_ray = 0, 0
-        ray_ini = False
-        minimal_distance = 250
-        step_forward = 132
-        
-        # Note: Should use estimated_pos instead of gps_values to avoid errors when GPS is lost
-        coords = self.estimated_pos
-        angle = self.estimated_angle
+    def mark_cell(self, cell: Tuple[int, int], value: int) -> None:
+        current = self.occupancy.get(cell)
+        if current is None or (current == 0 and value == 1):
+            self.occupancy[cell] = value
 
-        if coords is None: return [] # Avoid crash if GPS is lost and estimated_pos is not set
+    def update_grid_from_lidar(self) -> None:
+        if self.lidar_is_disabled():
+            return
+        lidar_values = self.lidar_values()
+        ray_angles = self.lidar_rays_angles()
+        if lidar_values is None or ray_angles is None:
+            return
 
+        step = GRID_RESOLUTION * 0.5
+        max_range = self.lidar().max_range
 
-        # Helper function to calculate angle deviation (used for sorting)
-        def sort_key_by_angle(item):
-            # item structure: ((x, y), visited)
-            target_pos = item[0]
-            dx = target_pos[0] - coords[0]
-            dy = target_pos[1] - coords[1]
-            
-            # Angle of the vector from drone to target point
-            target_vector_angle = math.atan2(dy, dx)
-            # Angle deviation from drone's heading (normalized to -pi to pi)
-            diff = normalize_angle(target_vector_angle - angle, False)
-            
-            # Return absolute value (closer to 0 is better)
-            return abs(diff)
+        for distance, angle in zip(lidar_values, ray_angles):
+            if distance <= 0:
+                continue
+            ray_angle = self.estimated_angle + angle
+            max_step = min(distance, max_range)
+            steps = int(max_step / step)
+            for idx in range(steps):
+                sample_dist = idx * step
+                sample_pos = self.estimated_pos + np.array([
+                    sample_dist * math.cos(ray_angle),
+                    sample_dist * math.sin(ray_angle),
+                ])
+                self.mark_cell(self.world_to_cell(sample_pos), 0)
+            if distance < max_range * 0.98:
+                hit_pos = self.estimated_pos + np.array([
+                    distance * math.cos(ray_angle),
+                    distance * math.sin(ray_angle),
+                ])
+                self.mark_cell(self.world_to_cell(hit_pos), 1)
 
-        if not self.lidar_is_disabled():
-            lidar_data = self.lidar_values()
-            ray_angles = self.lidar_rays_angles()
-            
-            for i in range(22, len(lidar_data) - 22):
-                if lidar_data[i] > minimal_distance:
-                    if lidar_data[i - 1] <= minimal_distance:
-                        if i == 22:
-                            ray_ini = True
-                        min_ray = ray_angles[i], i
-                else:
-                    if i != 0 and lidar_data[i - 1] > minimal_distance:
-                        max_ray = ray_angles[i - 1], i - 1
-                        if max_ray != min_ray and min_ray[1] + 3 < max_ray[1]:
-                            # Calculate coordinates
-                            avg_angle = (min_ray[0] + max_ray[0]) / 2
-                            tx = coords[0] + step_forward * math.cos(angle + avg_angle)
-                            ty = coords[1] + step_forward * math.sin(angle + avg_angle)
-                            list_possible_area.append(((tx, ty), False))
-                
-                # Handle edge case (circular wrap-around)
-                if i == len(lidar_data) - 23 and min_ray[1] > max_ray[1]:
-                    if ray_ini:
-                        boolean = True
-                        for k in range(min_ray[1], len(lidar_data) + 22):
-                            if boolean:
-                                if lidar_data[i % 181] <= minimal_distance:
-                                    boolean = False
+    def update_visits(self) -> None:
+        cell = self.world_to_cell(self.estimated_pos)
+        self.mark_cell(cell, 0)
+        self.visit_counts[cell] += 1
 
-                        if boolean:
-                            del list_possible_area[0]
-                            
-                            # Calculate last point
-                            avg_angle = (min_ray[0] + max_ray[0]) / 2
-                            tx = coords[0] + step_forward * math.cos(angle + avg_angle)
-                            ty = coords[1] + step_forward * math.sin(angle + avg_angle)
-                            list_possible_area.append(((tx, ty), False))
-                            
-                            # --- SORT BEFORE RETURNING ---
-                            list_possible_area.sort(key=sort_key_by_angle)
-                            return list_possible_area
+    def update_semantic(self) -> None:
+        if self.semantic_is_disabled():
+            return
+        semantic_data = self.semantic_values()
+        if not semantic_data:
+            return
 
-                    max_ray = ray_angles[i], i
-                    # Calculate last point (no loop)
-                    avg_angle = (min_ray[0] + max_ray[0]) / 2
-                    tx = coords[0] + step_forward * math.cos(angle + avg_angle)
-                    ty = coords[1] + step_forward * math.sin(angle + avg_angle)
-                    list_possible_area.append(((tx, ty), False))
+        for data in semantic_data:
+            if data.entity_type == DroneSemanticSensor.TypeEntity.RESCUE_CENTER:
+                angle_global = self.estimated_angle + data.angle
+                rx = self.estimated_pos[0] + data.distance * math.cos(angle_global)
+                ry = self.estimated_pos[1] + data.distance * math.sin(angle_global)
+                self.rescue_center_pos = np.array([rx, ry])
+            if data.entity_type == DroneSemanticSensor.TypeEntity.WOUNDED_PERSON and not data.grasped:
+                angle_global = self.estimated_angle + data.angle
+                px = self.estimated_pos[0] + data.distance * math.cos(angle_global)
+                py = self.estimated_pos[1] + data.distance * math.sin(angle_global)
+                key = self.world_to_cell(np.array([px, py]))
+                self.known_victims[key] = (np.array([px, py]), self.elapsed_timestep)
 
-        # --- SORT BEFORE RETURNING (Normal case) ---
-        list_possible_area.sort(key=sort_key_by_angle, reverse=True)
-        
-        return list_possible_area
+    def prune_messages(self) -> None:
+        stale_limit = self.elapsed_timestep - STALE_MESSAGE_TICKS
+        self.known_agents = {
+            agent_id: (pos, ts)
+            for agent_id, (pos, ts) in self.known_agents.items()
+            if ts >= stale_limit
+        }
+        self.known_victims = {
+            key: (pos, ts)
+            for key, (pos, ts) in self.known_victims.items()
+            if ts >= stale_limit
+        }
 
-    def update_mapper(self):
-        """Scan Lidar to find new frontier points."""
-        list_possible_area = self.lidar_possible_paths()
-        pos_key = tuple(self.estimated_pos)
-        if pos_key not in self.edge:
-            self.edge[pos_key] = [] 
-        for val in list_possible_area:
-            x = val[0][0]
-            y = val[0][1]
-            visited = False
-            for node in self.visited_node:
-                delta_x = x - node[0]
-                delta_y = y - node[1]
-                dist_to_target = math.hypot(delta_x, delta_y)
-                if dist_to_target < 30: visited = True
-            if not visited: 
-                self.edge[pos_key].append((x,y))
-                # print(f'Add new target {x}, {y}')
+    def select_frontier(self) -> Optional[np.ndarray]:
+        free_cells = [cell for cell, value in self.occupancy.items() if value == 0]
+        if not free_cells:
+            return None
 
+        frontier_cells = set()
+        for cell in free_cells:
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                neighbor = (cell[0] + dx, cell[1] + dy)
+                if neighbor not in self.occupancy:
+                    frontier_cells.add(neighbor)
 
+        if not frontier_cells:
+            return None
+
+        current_cell = self.world_to_cell(self.estimated_pos)
+        candidates = []
+        for cell in frontier_cells:
+            if (abs(cell[0] - current_cell[0]) > FRONTIER_SEARCH_RADIUS or
+                    abs(cell[1] - current_cell[1]) > FRONTIER_SEARCH_RADIUS):
+                continue
+            candidates.append(cell)
+
+        if not candidates:
+            candidates = list(frontier_cells)
+
+        best_score = None
+        best_cell = None
+        for cell in candidates:
+            cell_pos = self.cell_to_world(cell)
+            dist = np.linalg.norm(cell_pos - self.estimated_pos)
+            visit_penalty = self.visit_counts.get(cell, 0) * FRONTIER_VISIT_WEIGHT
+
+            repulsion = 0.0
+            for agent_pos, _ in self.known_agents.values():
+                agent_dist = np.linalg.norm(cell_pos - agent_pos)
+                if agent_dist < AGENT_REPULSION_RADIUS:
+                    repulsion += (AGENT_REPULSION_RADIUS - agent_dist) / AGENT_REPULSION_RADIUS
+
+            score = (dist * FRONTIER_DISTANCE_WEIGHT
+                     + repulsion * FRONTIER_REPULSION_WEIGHT
+                     + visit_penalty)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_cell = cell
+
+        if best_cell is None:
+            return None
+        return self.cell_to_world(best_cell)
+
+    def choose_victim_target(self) -> Optional[Tuple[Tuple[int, int], np.ndarray]]:
+        if not self.known_victims:
+            return None
+
+        best_key = None
+        best_score = None
+        for key, (pos, _) in self.known_victims.items():
+            if not self.is_closest_agent(pos):
+                continue
+            score = np.linalg.norm(pos - self.estimated_pos)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_key = key
+
+        if best_key is None:
+            return None
+        return best_key, self.known_victims[best_key][0]
+
+    def is_closest_agent(self, target_pos: np.ndarray) -> bool:
+        my_dist = np.linalg.norm(target_pos - self.estimated_pos)
+        for agent_id, (pos, _) in self.known_agents.items():
+            if agent_id == self.identifier:
+                continue
+            if np.linalg.norm(target_pos - pos) + VICTIM_ASSIGNMENT_MARGIN < my_dist:
+                return False
+        return True
 
     def move_to_target(self) -> CommandsDict:
-        """
-        Control the drone to move PRECISELY to the target.
-        Strategy: Go slow, rotate accurately, decelerate early.
-        """
-        # # print(f'Going to {self.current_target}') # Debug if needed
-        
         if self.current_target is None:
             return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0, "grasper": 0}
 
-        delta_x = self.current_target[0] - self.estimated_pos[0]
-        delta_y = self.current_target[1] - self.estimated_pos[1]
-        dist_to_target = math.hypot(delta_x, delta_y)
-
-        # 1. Rotate towards the target
-        target_angle = math.atan2(delta_y, delta_x)
+        delta = self.current_target - self.estimated_pos
+        dist = math.hypot(delta[0], delta[1])
+        target_angle = math.atan2(delta[1], delta[0])
         angle_error = normalize_angle(target_angle - self.estimated_angle)
-        
-        # Increase rotation force to correct heading faster
-        rotation_cmd = KP_ROTATION * angle_error
-        rotation_cmd = max(-1.0, min(1.0, rotation_cmd))
 
-        # 2. Move forward (NEW LOGIC: SLOW & STEADY)
-        
-        # Speed configuration
-        MAX_SPEED = 0.6
-        BRAKING_DIST = 150.0
-        STOP_DIST = 15.0 # Increase stopping distance slightly for safety
+        rotation_cmd = max(-1.0, min(1.0, 2.5 * angle_error))
+        forward_cmd = 0.6
+        if dist < 80:
+            forward_cmd = 0.4
+        if dist < 30:
+            forward_cmd = 0.2
+        if abs(angle_error) > 0.4:
+            forward_cmd = 0.0
 
-        if dist_to_target > BRAKING_DIST:
-            forward_cmd = MAX_SPEED
-        elif dist_to_target > STOP_DIST:
-            # Linear deceleration
-            # Removed max(0.1, ...) line to allow it to reduce close to 0
-            forward_cmd = (dist_to_target / BRAKING_DIST) * MAX_SPEED
-            forward_cmd = max(0.1, forward_cmd)
-        else:
-            # Very close (< 15px): Cut throttle completely
-            forward_cmd = 0.05
+        if not self.lidar_is_disabled():
+            lidar_vals = self.lidar_values()
+            if lidar_vals is not None and lidar_vals[len(lidar_vals) // 2] < 25:
+                forward_cmd = 0.0
+                rotation_cmd = 0.8
 
-        # 3. Rotation Discipline (Strict Rotation)
-        # Only allow movement if heading is accurate (deviation < 0.2 rad ~ 11 degrees)
-        # Old code was 0.5 (30 degrees) -> Too loose
-        if abs(angle_error) > 0.2:
-            forward_cmd = 0.0 # Stop to finish rotating
+        grasper = 1 if self.grasped_wounded_persons() else 0
 
-        forward_cmd = max(-1.0, min(1.0, forward_cmd))
-
-        # 4. Collision Avoidance (Lidar Safety) - Kept as is
-        # if self.lidar_using_state:
-        # lidar_vals = self.lidar_values()
-        # if lidar_vals is not None:
-        #     if lidar_vals[90] < SAFE_DISTANCE:
-        #         forward_cmd = 0.0 
-        #         rotation_cmd = 1.0 
-
-        # --- SPECIAL LOGIC FOR RETURNING (Carrying person) ---
-        if self.state == "RETURNING":
-            forward_cmd = 0.7
-        # else:
-        #     # print(f'Spec of moving, forward: {forward_cmd}, rotation: {rotation_cmd}')
-
-        grasper_val = 1 if (self.state == "RESCUING" or self.state == "RETURNING") else 0
-
-
-        # if not self.lidar_using_state:
-        #     return {
-        #         "forward": forward_cmd*1.5, 
-        #         "lateral": 0.0, 
-        #         "rotation": rotation_cmd, 
-        #         "grasper": grasper_val
-        #     }
-        # else:
-        # print(f'Spec of moving, forward: {forward_cmd}, rotation: {rotation_cmd}, dist: {dist_to_target}')
         return {
-            "forward": forward_cmd, 
-            "lateral": 0.0, 
-            "rotation": rotation_cmd, 
-            "grasper": grasper_val
+            "forward": forward_cmd,
+            "lateral": 0.0,
+            "rotation": rotation_cmd,
+            "grasper": grasper,
         }
-    
-    def visit(self, pos):
-        if pos is not None:
-            pos_key = tuple(pos) if isinstance(pos, np.ndarray) else pos
-            if pos_key not in self.visited_node: 
-                # print(f'Add {pos_key} to visited nodes')
-                self.visited_node.append(pos_key)
-
 
     def control(self) -> CommandsDict:
-        self.cnt_timestep += 1
-        check_center = False
-        
-        # 1. Update Navigator (Always run first)
-        self.update_navigator()
-        # 2. Process Communications (Update knowledge from other drones)
-        self.comms_visited()
-        #print(self.visited_node)
-        
-        # 3. Process Semantic Sensor (Find person / Station)
-        semantic_data = self.semantic_values()
-        found_person_pos = None
-        found_rescue_pos = None
-        
-        if semantic_data:
-            for data in semantic_data:
-                if data.entity_type == DroneSemanticSensor.TypeEntity.WOUNDED_PERSON and not data.grasped:
-                    # Calculate person position based on relative angle/distance
-                    angle_global = self.estimated_angle + data.angle
-                    px = self.estimated_pos[0] + data.distance * math.cos(angle_global)
-                    py = self.estimated_pos[1] + data.distance * math.sin(angle_global)
-                    found_person_pos = np.array([px, py])
-                
-                if data.entity_type == DroneSemanticSensor.TypeEntity.RESCUE_CENTER:
-                    # Save station position for later use
-                    check_center = True
-                    if self.rescue_center_pos is None:
-                        angle_global = self.estimated_angle + data.angle
-                        rx = self.estimated_pos[0] + data.distance * math.cos(angle_global)
-                        ry = self.estimated_pos[1] + data.distance * math.sin(angle_global)
-                        self.rescue_center_pos = np.array([rx, ry])
-                    found_rescue_pos = True
+        self.update_estimate()
+        self.update_grid_from_lidar()
+        self.update_visits()
+        self.update_semantic()
+        self.merge_messages()
+        self.prune_messages()
 
+        if self.state == "RETURN" and not self.grasped_wounded_persons():
+            self.state = "EXPLORE"
+            self.target_victim_key = None
+            self.current_target = None
 
-        # 4. STATE MACHINE
-        
-        # --- STATE: EXPLORING ---
-        if self.state == "EXPLORING":
-            if self.cnt_timestep == 2400: self.state = "RETURNING"
-            # If person found -> Switch to rescue
-            if found_person_pos is not None:
-                self.state = "RESCUING"
-                # print(f'Going to rescue from {self.current_target} to {found_person_pos}')
-                self.position_before_rescue = self.current_target
-                self.current_target = found_person_pos
-                # child_key = tuple(found_person_pos)
-                # self.path_history[child_key] = self.current_target
-                # self.current_target = found_person_pos
-                # cur_key = tuple(self.current_target)
-                # # print(f'Check key valid: {cur_key in self.path_history}')
-            
-            # If no target or reached old target
-            elif self.current_target is None or np.linalg.norm(self.estimated_pos - self.current_target) < REACH_THRESHOLD:
-                self.visit(self.current_target)
-                # print(f'Arrived {self.current_target}')
-                
-                # 2. Update Mapper (To find new paths)
-                if self.current_target is None: self.visit(self.estimated_pos)
-                self.update_mapper()
+        if self.grasped_wounded_persons() and self.rescue_center_pos is not None:
+            self.state = "RETURN"
+            self.current_target = self.rescue_center_pos
+            if np.linalg.norm(self.estimated_pos - self.rescue_center_pos) < RESCUE_DROP_DISTANCE:
+                return {
+                    "forward": 0.0,
+                    "lateral": 0.0,
+                    "rotation": 0.0,
+                    "grasper": 0,
+                }
 
+        if self.state != "RETURN":
+            victim_choice = self.choose_victim_target()
+            if victim_choice is not None:
+                victim_key, victim_pos = victim_choice
+                self.state = "RESCUE"
+                self.target_victim_key = victim_key
+                self.current_target = victim_pos
 
-                pos_key = tuple(self.estimated_pos)
-                if pos_key in self.edge and len(self.edge[pos_key]):
-                    next_target = self.edge[pos_key].pop()
-                    
-                    if self.current_target is None: self.path_history[next_target] = self.estimated_pos
-                    else: self.path_history[next_target] = self.current_target
-                    
-                    self.current_target = np.array(next_target)
-                else:
-                    # No more exploration paths -> Return to previous node
-                    current_key = tuple(self.current_target) if self.current_target is not None else None
-                    if current_key and current_key in self.path_history:
-                         self.current_target = self.path_history[current_key]
-                         # print('Goint to parent node')
-                    else:
-                        # Handle when there's no return path
-                        # print("No parent node found, staying at current position")
-                        self.current_target = self.estimated_pos.copy()
-                # print(f'Choose next target: {self.current_target}')
-
-
-        # --- STATE: RESCUING ---
-        elif self.state == "RESCUING":
-
-            if found_person_pos is not None and not self.grasped_wounded_persons():
-                # print(f'Going to rescue from {self.current_target} to {found_person_pos}')
-                self.current_target = found_person_pos
-                # child_key = tuple(found_person_pos)
-                # parent_node = self.current_target if self.current_target is not None else self.estimated_pos
-                # self.path_history[child_key] = parent_node.copy()
-                # # print(f'Save parent: parent: {parent_node}, child: {child_key}')
-
-            # Check if already grasped
+        if self.state == "RESCUE":
+            if self.target_victim_key in self.known_victims:
+                self.current_target = self.known_victims[self.target_victim_key][0]
+            if np.linalg.norm(self.estimated_pos - self.current_target) < VICTIM_GRAB_DISTANCE:
+                return {
+                    "forward": 0.0,
+                    "lateral": 0.0,
+                    "rotation": 0.0,
+                    "grasper": 1,
+                }
             if self.grasped_wounded_persons():
-                self.state = "RETURNING"
-                self.lidar_using_state = False
-                self.current_target = self.position_before_rescue
-                # print(f'Graped person at target {self.current_target} and go back to {self.current_target}')
+                self.state = "RETURN"
 
+        if self.state != "RESCUE":
+            if self.current_target is None or np.linalg.norm(self.estimated_pos - self.current_target) < GRID_RESOLUTION:
+                self.current_target = self.select_frontier()
 
-        # --- STATE: RETURNING ---
-        elif self.state == "RETURNING":
-            if check_center:
-                # print(f'See rescue center at {self.rescue_center_pos} with dist {np.linalg.norm(self.estimated_pos - self.rescue_center_pos)}')
-                self.current_target = self.rescue_center_pos
-                if found_rescue_pos and np.linalg.norm(self.estimated_pos - self.current_target) < 15:
-                    # print(f'Start dropping person at {self.estimated_pos}')
-                    self.state = "DROPPING"
-            else:
+        if self.current_target is None:
+            self.current_target = self.estimated_pos.copy()
 
-                # print(f'Return, dist: {np.linalg.norm(self.estimated_pos - self.current_target)}')
-                if np.linalg.norm(self.estimated_pos - self.current_target) < REACH_THRESHOLD:
-
-                    current_key = tuple(self.current_target) if self.current_target is not None else None
-                    # print(f'Check key {current_key} and {current_key in self.path_history}')
-                    if current_key and current_key in self.path_history: 
-                        # print(f'Check parent: {self.path_history[current_key]}')
-                        self.current_target = self.path_history[current_key]
-                        # print(f'Going back to parent')
-                    else:
-                        # If rescue center found -> go straight to it
-                        if self.rescue_center_pos is not None:
-                            self.current_target = self.rescue_center_pos
-                        
-                        # If reached destination (station)
-                        if found_rescue_pos and np.linalg.norm(self.estimated_pos - self.current_target) < REACH_THRESHOLD:
-                            self.state = "DROPPING"
-                # print(f'Going back to {self.current_target}, at {self.estimated_pos}')
-
-
-        # --- STATE: DROPPING ---
-        elif self.state == "DROPPING":
-            # Stop and release
-            # print(f'Finish dropped')
-            # self.reset()
-            # self.state = "EXPLORING"
-            self.current_target = self.initial_position
-
-        # 5. Execute movement
         return self.move_to_target()
 
-
     def define_message_for_all(self):
-        """
-        Send the current position of the drone
-        """
-        return {'id': self.identifier, 'position': self.estimated_pos}
-    def comms_visited(self):
-        """Add the visited nodes from other drones to self.visited_node, using self.visit(pos)
-        """
-        if self.communicator:
-            for msg in self.communicator.received_messages:
-                if msg and 'position' in msg:
-                    self.visit(msg['position'])
-            
+        victims_payload = [
+            {"pos": pos.tolist(), "t": ts}
+            for pos, ts in self.known_victims.values()
+        ]
+        return {
+            "id": self.identifier,
+            "pos": self.estimated_pos.tolist(),
+            "t": self.elapsed_timestep,
+            "victims": victims_payload,
+            "rescue_center": None if self.rescue_center_pos is None else self.rescue_center_pos.tolist(),
+        }
+
+    def merge_messages(self) -> None:
+        if not self.communicator:
+            return
+        for msg in self.communicator.received_messages:
+            if not msg:
+                continue
+            sender = msg.get("id")
+            pos = msg.get("pos")
+            ts = msg.get("t")
+            if sender is not None and pos is not None and ts is not None:
+                self.known_agents[sender] = (np.array(pos), ts)
+            rescue_center = msg.get("rescue_center")
+            if rescue_center is not None and self.rescue_center_pos is None:
+                self.rescue_center_pos = np.array(rescue_center)
+            for victim in msg.get("victims", []):
+                victim_pos = np.array(victim["pos"])
+                victim_ts = victim["t"]
+                key = self.world_to_cell(victim_pos)
+                existing = self.known_victims.get(key)
+                if existing is None or victim_ts > existing[1]:
+                    self.known_victims[key] = (victim_pos, victim_ts)
